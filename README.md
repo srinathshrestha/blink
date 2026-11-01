@@ -1,6 +1,6 @@
 # Blink
 
-![Blink](docs/blink.png)
+![Blink](docs/blink-light.png)
 
 I got fed up with Spotlight after the Golden Gate update, and the other replacements felt bloated. I just wanted something fast that launches apps and searches files. So I made this. That's it.
 
