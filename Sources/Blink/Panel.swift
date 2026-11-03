@@ -318,11 +318,26 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
     func setPrompt(_ name: String) {}
 
     func apply(_ r: [Hit], _ q: String) {
+        let old = hits
         hits = r
         syncHint()
         hitsQuery = Self.highlightQuery(q)
-        table.reloadData()
-        if !r.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false) }
+        // Same rows, same heights: refresh the live cells in place. reloadData rebuilds every row view
+        // (key-view loop, layout), which was most of the main-thread time per keystroke.
+        var cells: [ResultCell] = []
+        if !r.isEmpty, old.count == r.count, zip(old, r).allSatisfy({ ResultCell.isLCD($0) == ResultCell.isLCD($1) }) {
+            for row in 0..<r.count {
+                guard let c = table.view(atColumn: 0, row: row, makeIfNecessary: false) as? ResultCell else { break }
+                cells.append(c)
+            }
+        }
+        if !r.isEmpty, cells.count == r.count {
+            table.selectRowIndexes([0], byExtendingSelection: false)
+            for (row, c) in cells.enumerated() { c.configure(r[row], query: hitsQuery, selected: row == 0) }
+        } else {
+            table.reloadData()
+            if !r.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false) }
+        }
         updateFooter()
         resize()
     }
@@ -466,8 +481,14 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         if settingsOpen { return false }       // arrows, space, return, esc belong to the card
         guard cmdOnly else { return false }
         switch chars.lowercased() {
+        // No main menu in an accessory app, so the standard edit shortcuts are sent to the field editor by hand.
+        case "v": return NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+        case "x": return NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil)
+        case "a": return NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
         case "c":
-            if let tv = panel.firstResponder as? NSTextView, tv.selectedRange().length > 0 { return false }
+            if let tv = panel.firstResponder as? NSTextView, tv.selectedRange().length > 0 {
+                return NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil)
+            }
             return copySelected()
         case "t": return terminalSelected()
         case "z":
@@ -503,20 +524,22 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         guard let h = selectedHit, h.calc == nil, !h.path.isEmpty else { return false }
         guard Self.trashable(h.path) else { flash("Can't move system items to Trash", seconds: 3); return true }
         let url = URL(fileURLWithPath: h.path)
-        var out: NSURL?
-        do { try FileManager.default.trashItem(at: url, resultingItemURL: &out) }
-        catch {
-            let m = (error as NSError).localizedDescription
-            flash("Can't trash: " + (m.count > 70 ? String(m.prefix(70)) + "…" : m), seconds: 4)
-            return true
-        }
+        // NSWorkspace.recycle (unlike FileManager.trashItem) records the original location, so Finder's Put Back works.
         hideLock.lock(); hidden.insert(h.path); hideLock.unlock()
-        if let t = out as URL? {
-            trashStack.append((url, t))
-            undoDeadline = Date().addingTimeInterval(4)
-            flashText = nil; flash("Moved to Trash · ⌘Z to undo")
-        } else {
-            flash("Moved to Trash")
+        NSWorkspace.shared.recycle([url]) { [weak self] moved, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let t = moved[url] {
+                    self.trashStack.append((url, t))
+                    self.undoDeadline = Date().addingTimeInterval(4)
+                    self.flashText = nil; self.flash("Moved to Trash · ⌘Z to undo")
+                } else {
+                    let m = error?.localizedDescription ?? "unknown error"
+                    self.hideLock.lock(); self.hidden.remove(h.path); self.hideLock.unlock()
+                    self.flash("Can't trash: " + (m.count > 70 ? String(m.prefix(70)) + "…" : m), seconds: 4)
+                    if !self.historyShown { self.runSearch(self.field.stringValue) }
+                }
+            }
         }
         // drop the row right now, then refill from a fresh search
         let row = table.selectedRow

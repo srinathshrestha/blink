@@ -476,31 +476,52 @@ final class Index {
         lock.lock(); let snapshot = entries; let use = usage; lock.unlock()
         let q = Array(rest.lowercased().utf8)
 
-        var top: [(Int, Int)] = []   // (score, index) sorted desc
-        top.reserveCapacity(limit + 1)
+        if q.isEmpty { return mostUsed(use, kbit, limit) }
 
-        if q.isEmpty {
-            // most-used first
-            for (i, e) in snapshot.enumerated() {
-                guard let c = use[e.path], e.mask & kbit == kbit else { continue }
-                insert(&top, (c, i), limit)
-            }
-        } else {
-            let n = q.count
-            let first = q[0]
-            let qmask = Entry.mask(of: q) | kbit   // a filter is just one more required bit
+        let n = q.count
+        let first = q[0]
+        let qmask = Entry.mask(of: q) | kbit   // a filter is just one more required bit
+
+        // Big indexes are scanned in chunks on every core, each keeping its own top `limit`; the chunks are then
+        // merged in index order with the same tie rule, so the result is identical to one sequential scan.
+        let count = snapshot.count
+        let chunks = count >= Index.parallelMin ? Index.cores * 4 : 1
+        let step = (count + chunks - 1) / chunks
+        var parts = [[(Int, Int)]](repeating: [], count: chunks)
+        q.withUnsafeBufferPointer { qb in
             snapshot.withUnsafeBufferPointer { buf in
-                for i in 0..<buf.count {
-                    if buf[i].mask & qmask != qmask { continue }
-                    let e = buf[i]
-                    let t = e.lower
-                    if t.count < n { continue }
-                    guard var s = Index.score(q, n, first, t) else { continue }
-                    if e.kind == 2 { s += 60 }
-                    if let c = use[e.path] { s += min(c, 20) * 8 }
-                    if top.count == limit, s <= top[limit - 1].0 { continue }
-                    insert(&top, (s, i), limit)
+                parts.withUnsafeMutableBufferPointer { outBuf in
+                    let out = outBuf.baseAddress!      // each chunk writes only its own slot
+                    let scan: (Int) -> Void = { c in
+                        let lo = c * step, hi = min(count, lo + step)
+                        if lo >= hi { return }
+                        var top: [(Int, Int)] = []   // (score, index) sorted desc
+                        top.reserveCapacity(limit + 1)
+                        for i in lo..<hi {
+                            if buf[i].mask & qmask != qmask { continue }
+                            // Read the name in place: copying the whole Entry would retain and release its path and name.
+                            guard var s = buf[i].lower.withUnsafeBufferPointer({ t -> Int? in
+                                t.count < n ? nil : Index.score(qb, n, first, t)
+                            }) else { continue }
+                            if buf[i].kind == 2 { s += 60 }
+                            // The usage bonus is at most 160: skip the string hash for anything that can't reach the top.
+                            if top.count == limit, s + 160 <= top[limit - 1].0 { continue }
+                            if let c = use[buf[i].path] { s += min(c, 20) * 8 }
+                            if top.count == limit, s <= top[limit - 1].0 { continue }
+                            self.insert(&top, (s, i), limit)
+                        }
+                        out[c] = top
+                    }
+                    if chunks == 1 { scan(0) } else { DispatchQueue.concurrentPerform(iterations: chunks, execute: scan) }
                 }
+            }
+        }
+        var top: [(Int, Int)] = []
+        top.reserveCapacity(limit + 1)
+        for part in parts {
+            for item in part {
+                if top.count == limit, item.0 <= top[limit - 1].0 { continue }
+                insert(&top, item, limit)
             }
         }
         return top.map { _, i in
@@ -511,6 +532,31 @@ final class Index {
             return Hit(path: e.path, name: name, isApp: e.isApp, isDir: dir,
                        isProject: dir && Project.isProject(e.path))
         }
+    }
+
+    private static let cores = ProcessInfo.processInfo.activeProcessorCount
+    private static let parallelMin = 50_000      // below this, one thread beats the cost of fanning out
+
+    /// The empty query (what opening the panel shows): the most-used paths that still exist.
+    /// Walks the small usage table instead of hashing every indexed path.
+    private func mostUsed(_ use: [String: Int], _ kbit: UInt32, _ limit: Int) -> [Hit] {
+        var out: [Hit] = []
+        let ranked = use.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+        for (path, _) in ranked {
+            var st = stat()
+            if lstat(path, &st) != 0 { continue }          // deleted since
+            var isDir = st.st_mode & S_IFMT == S_IFDIR
+            if st.st_mode & S_IFMT == S_IFLNK, stat(path, &st) == 0 { isDir = st.st_mode & S_IFMT == S_IFDIR }
+            let app = isDir && path.hasSuffix(".app")
+            let kind: UInt8 = app ? 2 : (isDir ? 1 : 0)
+            if Entry.kindBit(kind) & kbit != kbit { continue }
+            var name = (path as NSString).lastPathComponent
+            if app { name = (name as NSString).deletingPathExtension }
+            out.append(Hit(path: path, name: name, isApp: app, isDir: kind == 1,
+                           isProject: kind == 1 && Project.isProject(path)))
+            if out.count == limit { break }
+        }
+        return out
     }
 
     private func insert(_ top: inout [(Int, Int)], _ item: (Int, Int), _ limit: Int) {
@@ -524,7 +570,7 @@ final class Index {
     @inline(__always)
     private static func isSep(_ c: UInt8) -> Bool { c == 32 || c == 45 || c == 95 || c == 46 }
 
-    private static func score(_ q: [UInt8], _ n: Int, _ first: UInt8, _ t: [UInt8]) -> Int? {
+    private static func score(_ q: UnsafeBufferPointer<UInt8>, _ n: Int, _ first: UInt8, _ t: UnsafeBufferPointer<UInt8>) -> Int? {
         let m = t.count
         // contiguous substring match (strongest)
         if m >= n {

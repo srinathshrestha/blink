@@ -159,7 +159,7 @@ enum Glyph {
 /// A physical keycap carrying one glyph. Apps skip the cap and show their real icon.
 final class KeyIcon: NSView {
     var glyph = "fil" { didSet { if glyph != oldValue { needsDisplay = true } } }
-    var appImage: NSImage? { didSet { needsDisplay = true } }
+    var appImage: NSImage? { didSet { if appImage !== oldValue { needsDisplay = true } } }
     var selected = false { didSet { if selected != oldValue { needsDisplay = true } } }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -452,7 +452,7 @@ final class ResultCell: NSTableCellView {
     func configure(_ h: Hit, query: String, selected: Bool) {
         hit = h; self.query = query
         isLCD = Self.isLCD(h)
-        isSel = selected; icon.needsDisplay = true; refresh(force: true)
+        isSel = selected; refresh(force: true)     // the icon redraws itself when its glyph, image or selection changes
     }
 
     private func refresh(force: Bool = false) {
