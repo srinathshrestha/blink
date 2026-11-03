@@ -79,6 +79,10 @@ enum Calc {
                 let t = formatBase(Int64(v), b)
                 out.append(CalcRow(copy: t, shown: t, label: "\(fmtG(v)) in \(baseLabel(b))", tag: "CNV"))
             }
+        } else if p.usedBase, v == v.rounded(), v < 0, v >= -9.2e18 {
+            // a negative result (~5, 0 - 1): show the 64-bit two's complement bit pattern
+            let t = "0x" + String(UInt64(bitPattern: Int64(v)), radix: 16, uppercase: true)
+            out.append(CalcRow(copy: t, shown: t, label: "\(fmtG(v)) as 64-bit hex", tag: "CNV"))
         }
         return out
     }
@@ -955,6 +959,12 @@ enum Calc {
         }
 
         mutating func unary() -> Double? {
+            if peek() == "~" {                                // bitwise NOT on a 64-bit integer: ~5 = -6
+                i += 1
+                guard let v = unary(), let a = Int64(exactly: v) else { return nil }
+                nontrivial = true; usedBase = true
+                return Double(~a)
+            }
             if let ch = peek(), ch == "-" || ch == "+" {
                 i += 1
                 guard let v = unary() else { return nil }

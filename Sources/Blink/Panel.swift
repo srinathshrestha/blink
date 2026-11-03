@@ -275,8 +275,12 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
     /// and the keystroke and its results land in the same frame.
     static let inlineLimit = 200_000
 
+    /// "/usr/lo", "~", "~/dev": a path. A leading "~" followed by anything else ("~5") is the calculator's bitwise NOT.
     @inline(__always) static func isPathQuery(_ q: String) -> Bool {
-        let f = q.utf8.first; return f == 47 || f == 126      // "/" or "~"
+        let u = q.utf8
+        guard let f = u.first else { return false }
+        if f == 47 { return true }
+        return f == 126 && (u.count == 1 || u[u.index(after: u.startIndex)] == 47)
     }
     /// d: f: a: filter prefix (the index understands it; calculator rows are skipped).
     static func hasFilterPrefix(_ q: String) -> Bool {
@@ -286,8 +290,8 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
     }
     /// What gets lit up in result names: the query without its filter prefix, or the last path fragment.
     static func highlightQuery(_ q: String) -> String {
-        guard let f = q.utf8.first else { return q }
-        if f == 47 || f == 126 {
+        if q.isEmpty { return q }
+        if isPathQuery(q) {
             if let i = q.lastIndex(of: "/") { return String(q[q.index(after: i)...]) }
             return ""
         }
